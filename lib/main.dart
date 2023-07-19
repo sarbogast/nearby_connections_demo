@@ -1,4 +1,13 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:device_info_plus/device_info_plus.dart';
 import 'package:flutter/material.dart';
+import 'package:nearby_connections/nearby_connections.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:uuid/uuid.dart';
+
+const p2pServiceId = 'com.epseelon.nearby_connections_demo';
 
 void main() {
   runApp(const MyApp());
@@ -7,46 +16,21 @@ void main() {
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Flutter Demo',
       theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a blue toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
         useMaterial3: true,
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const MyHomePage(title: 'Nearby Connections Demo'),
     );
   }
 }
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
 
   final String title;
 
@@ -55,71 +39,340 @@ class MyHomePage extends StatefulWidget {
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+  final _messageController = TextEditingController();
+  final _nearby = Nearby();
+  final List<String> _discoveredEndpoints = [];
+  final String userId = const Uuid().v4();
+  bool? _advertiser;
+  bool _advertising = false;
+  bool _discovering = false;
 
-  void _incrementCounter() {
+  String? _connectedEndpoint;
+  String? _connectingEndpoint;
+
+  @override
+  void dispose() {
+    _messageController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _startAdvertising() async {
+    final locationStatus = await Permission.location.request();
+    if (!locationStatus.isGranted) return;
+    final locationEnabled = await Permission.location.serviceStatus.isEnabled;
+    if (!locationEnabled) return;
+    final permissionStatus = await [
+      Permission.bluetooth,
+      Permission.bluetoothAdvertise,
+      Permission.bluetoothConnect,
+      Permission.bluetoothScan
+    ].request();
+    if (!permissionStatus.values.every((element) => element.isGranted)) return;
+
+    bool advertising = await _nearby.startAdvertising(
+      userId,
+      Strategy.P2P_STAR,
+      onConnectionInitiated: (String endpointId, ConnectionInfo info) async {
+        debugPrint(
+            'Connection initiated with ID $endpointId:\n- Endpoint: ${info.endpointName}\n- Authentication token: ${info.authenticationToken}\n- Incoming connection? ${info.isIncomingConnection ? 'YES' : 'NO'}');
+        _nearby.acceptConnection(
+          endpointId,
+          onPayLoadRecieved: _onPayloadReceived,
+          onPayloadTransferUpdate: _onPayloadTransferUpdate,
+        );
+      },
+      onConnectionResult: (String endpointId, Status status) {
+        debugPrint(
+            'Connection result for connection with ID $endpointId: ${status.name}');
+        setState(() {
+          _connectedEndpoint = endpointId;
+        });
+      },
+      onDisconnected: (String endpointId) {
+        debugPrint('Disconnected from $endpointId');
+        setState(() {
+          _connectedEndpoint = null;
+        });
+      },
+      serviceId: p2pServiceId,
+    );
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _advertising = advertising;
     });
+  }
+
+  Future<void> _stopAdvertising() async {
+    await _nearby.stopAdvertising();
+    setState(() {
+      _advertising = false;
+    });
+  }
+
+  Future<void> _startDiscovering() async {
+    setState(() {
+      _discoveredEndpoints.clear();
+    });
+    final locationStatus = await Permission.location.request();
+    if (!locationStatus.isGranted) return;
+    final locationEnabled = await Permission.location.serviceStatus.isEnabled;
+    if (!locationEnabled) return;
+    final permissionStatus = await [
+      // Ask
+      Permission.bluetooth,
+      Permission.bluetoothAdvertise,
+      Permission.bluetoothConnect,
+      Permission.bluetoothScan
+    ].request();
+    if (!permissionStatus.values.every((element) => element.isGranted)) return;
+
+    DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
+    AndroidDeviceInfo androidInfo = await deviceInfo.androidInfo;
+    final apiLevel = androidInfo.version.sdkInt;
+    final wifiPermissionGranted = apiLevel >= 33
+        ? await Permission.nearbyWifiDevices.request() ==
+            PermissionStatus.granted
+        : true;
+    if (!wifiPermissionGranted) return;
+
+    bool discovering = await Nearby().startDiscovery(
+      userId,
+      Strategy.P2P_STAR,
+      onEndpointFound: (String endpointId, String userName, String serviceId) {
+        debugPrint(
+            'Endpoint found: $endpointId\n- User name: $userName\n- Service ID: $serviceId');
+        setState(() {
+          _discoveredEndpoints.add(endpointId);
+        });
+      },
+      onEndpointLost: (String? endpointId) {
+        debugPrint('Endpoint lost: $endpointId');
+        setState(() {
+          _discoveredEndpoints.remove(endpointId);
+        });
+      },
+      serviceId: p2pServiceId,
+    );
+
+    setState(() {
+      _discovering = discovering;
+    });
+  }
+
+  Future<void> _stopDiscovering() async {
+    await _nearby.stopDiscovery();
+    setState(() {
+      _discoveredEndpoints.clear();
+      _discovering = false;
+    });
+  }
+
+  void _exit() {
+    if (_connectedEndpoint != null) {
+      _nearby.disconnectFromEndpoint(_connectedEndpoint!);
+    }
+    if (_discovering) _stopDiscovering();
+    if (_advertising) _stopAdvertising();
+    setState(() {
+      _advertiser = null;
+      _discoveredEndpoints.clear();
+    });
+    _messageController.clear();
+  }
+
+  Future<void> _toggleConnection(String endpoint) async {
+    if (_connectedEndpoint == null) {
+      //connect to endpoint
+      await _connect(endpoint);
+    } else {
+      if (_connectedEndpoint == endpoint) {
+        //disconnect from endpoint
+        await _nearby.disconnectFromEndpoint(_connectedEndpoint!);
+        setState(() {
+          _connectedEndpoint = null;
+        });
+      } else {
+        //disconnect from old endpoint and connect to the new one
+        await _nearby.disconnectFromEndpoint(_connectedEndpoint!);
+        setState(() {
+          _connectedEndpoint = null;
+        });
+
+        await _connect(endpoint);
+      }
+    }
+  }
+
+  Future<void> _connect(String endpoint) async {
+    final connectionRequested = await _nearby.requestConnection(
+      userId,
+      endpoint,
+      onConnectionInitiated: (endpointId, connectionInfo) {
+        debugPrint(
+            'Connection initiated with $endpointId:\n- Endpoint name: ${connectionInfo.endpointName}\n- Authentication token: ${connectionInfo.authenticationToken}\n- Is incoming? ${connectionInfo.isIncomingConnection ? 'YES' : 'NO'}');
+        _nearby.acceptConnection(
+          endpointId,
+          onPayLoadRecieved: _onPayloadReceived,
+          onPayloadTransferUpdate: _onPayloadTransferUpdate,
+        );
+        setState(() {
+          _connectingEndpoint = endpointId;
+          _connectedEndpoint = null;
+        });
+      },
+      onConnectionResult: (endpointId, status) {
+        debugPrint('Connection result with $endpointId: $status');
+        switch (status) {
+          case Status.CONNECTED:
+            setState(() {
+              _connectingEndpoint = null;
+              _connectedEndpoint = endpointId;
+            });
+            break;
+          case Status.REJECTED:
+            setState(() {
+              _connectingEndpoint = null;
+              _connectedEndpoint = null;
+            });
+            break;
+          case Status.ERROR:
+            setState(() {
+              _connectingEndpoint = null;
+              _connectedEndpoint = null;
+            });
+        }
+      },
+      onDisconnected: (endpointId) {
+        debugPrint('Disconnected from $endpointId');
+        if (endpointId == _connectedEndpoint) {
+          setState(() {
+            _connectedEndpoint = null;
+          });
+        }
+      },
+    );
+
+    setState(() {
+      _connectingEndpoint = connectionRequested ? endpoint : null;
+    });
+  }
+
+  Future<void> _onPayloadReceived(String endpointId, Payload payload) async {
+    debugPrint('Payload received from $endpointId');
+    if (payload.type == PayloadType.BYTES) {
+      final message = utf8.decode(payload.bytes!);
+      debugPrint('Message: $message');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(message),
+        ),
+      );
+    }
+  }
+
+  Future<void> _onPayloadTransferUpdate(
+    String endpointId,
+    PayloadTransferUpdate payloadTransferUpdate,
+  ) async {
+    debugPrint('Payload transfer update from $endpointId');
+  }
+
+  Future<void> _sendMessage(String message) async {
+    if (_connectedEndpoint == null) return;
+    try {
+      await _nearby.sendBytesPayload(
+        _connectedEndpoint!,
+        Uint8List.fromList(utf8.encode(message)),
+      );
+      _messageController.clear();
+    } catch (e) {
+      debugPrint(e.toString());
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
         backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
         title: Text(widget.title),
       ),
       body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
           mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text(
-              'You have pushed the button this many times:',
-            ),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
+          children: [
+            if (_advertiser == null)
+              ElevatedButton(
+                onPressed: () => setState(() {
+                  _advertiser = true;
+                }),
+                child: const Text("Advertiser"),
+              ),
+            if (_advertiser == null)
+              ElevatedButton(
+                onPressed: () => setState(() {
+                  _advertiser = false;
+                }),
+                child: const Text('Discoverer'),
+              ),
+            if (_advertiser == true && !_advertising)
+              ElevatedButton(
+                onPressed: () => _startAdvertising(),
+                child: const Text('Start Advertising'),
+              ),
+            if (_advertiser == true && _advertising)
+              ElevatedButton(
+                onPressed: () => _stopAdvertising(),
+                child: const Text('Stop Advertising'),
+              ),
+            if (_advertiser == false && !_discovering)
+              ElevatedButton(
+                onPressed: () => _startDiscovering(),
+                child: const Text('Start Discovering'),
+              ),
+            if (_advertiser == false && _discovering)
+              ElevatedButton(
+                onPressed: () => _stopDiscovering(),
+                child: const Text('Stop Discovering'),
+              ),
+            if (_advertiser != null)
+              ElevatedButton(
+                onPressed: () => _exit(),
+                child: const Text('Exit'),
+              ),
+            if (_connectedEndpoint != null)
+              TextField(
+                decoration: const InputDecoration(
+                  hintText: 'Message',
+                ),
+                controller: _messageController,
+                onEditingComplete: () => _sendMessage(_messageController.text),
+              ),
+            if (_discoveredEndpoints.isNotEmpty)
+              Expanded(
+                child: ListView.builder(
+                  itemCount: _discoveredEndpoints.length,
+                  itemBuilder: (context, index) {
+                    final endpoint = _discoveredEndpoints[index];
+                    return Card(
+                      child: ListTile(
+                        leading: _connectedEndpoint == endpoint
+                            ? const Icon(Icons.check)
+                            : (_connectingEndpoint == endpoint
+                                ? const CircularProgressIndicator()
+                                : null),
+                        title: Text(endpoint),
+                        onTap: _connectingEndpoint == null
+                            ? () => _toggleConnection(endpoint)
+                            : null,
+                      ),
+                    );
+                  },
+                ),
+              ),
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }
